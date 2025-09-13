@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  GO_VERSION: '1.21'  # Update to your Go version
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Get dependencies
+        run: go mod download
+
+      - name: Build binaries
+        run: |
+          # Build for multiple platforms
+          platforms=("linux/amd64" "linux/arm64" "darwin/amd64" "darwin/arm64" "windows/amd64")
+          
+          for platform in "${platforms[@]}"; do
+            platform_split=(${platform//\// })
+            GOOS=${platform_split[0]}
+            GOARCH=${platform_split[1]}
+            
+            output_name="myapp-${GOOS}-${GOARCH}"
+            if [ $GOOS = "windows" ]; then
+              output_name="${output_name}.exe"
+            fi
+            
+            echo "Building ${output_name}..."
+            GOOS=$GOOS GOARCH=$GOARCH go build -v -ldflags="-s -w -X main.version=${GITHUB_REF#refs/tags/}" -o dist/${output_name} ./...
+            
+            # Create tar.gz for non-Windows
+            if [ $GOOS != "windows" ]; then
+              tar -czf dist/${output_name}.tar.gz -C dist ${output_name}
+              rm dist/${output_name}
+            else
+              # Create zip for Windows
+              cd dist && zip ${output_name}.zip ${output_name} && rm ${output_name} && cd ..
+            fi
+          done
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          echo "## What's Changed" > changelog.md
+          git log $(git describe --tags --abbrev=0 HEAD^)..HEAD --pretty=format:"* %s (%h)" >> changelog.md
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/*
+          body_path: changelog.md
+          draft: false
+          prerelease: false
+          generate_release_notes: true

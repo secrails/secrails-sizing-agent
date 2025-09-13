@@ -6,6 +6,8 @@ import (
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsConf "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/organizations"
 	"github.com/aws/aws-sdk-go-v2/service/resourcegroupstaggingapi"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
@@ -19,6 +21,7 @@ import (
 
 // AWSProvider implements the Provider interface for AWS
 type AWSProvider struct {
+	config    config.ProviderConfig
 	awsConfig aws.Config
 
 	// AWS SDK clients
@@ -27,16 +30,18 @@ type AWSProvider struct {
 	taggingClients map[string]*resourcegroupstaggingapi.Client
 
 	// Account information
-	currentAccountID    string
+	currentAccount      *CallerIdentity
 	currentAccountAlias string
 	accounts            []models.AccountCount
+	regions             []string
 
 	mu sync.RWMutex
 }
 
 // NewAWSProvider creates a new AWS provider
-func NewAWSProvider(config.ProviderConfig) (*AWSProvider, error) {
+func NewAWSProvider(cfg config.ProviderConfig) (*AWSProvider, error) {
 	provider := &AWSProvider{
+		config:         cfg,
 		taggingClients: make(map[string]*resourcegroupstaggingapi.Client),
 		accounts:       []models.AccountCount{},
 	}
@@ -51,29 +56,112 @@ func (p *AWSProvider) Name() string {
 
 // Connect establishes connection to AWS
 func (p *AWSProvider) Connect(ctx context.Context) error {
-	logging.Info("Connecting to AWS...")
+	// Step 1: Load AWS configuration
+	if err := p.loadAWSConfig(ctx); err != nil {
+		return fmt.Errorf("failed to load AWS config: %w", err)
+	}
+
+	// Step 2: Create STS client for identity verification
+	p.stsClient = sts.NewFromConfig(p.awsConfig)
+
+	// Step 3: Verify credentials by getting caller identity
+	if err := p.verifyCredentials(ctx); err != nil {
+		return fmt.Errorf("failed to verify AWS credentials: %w", err)
+	}
+
+	// Step 4: Initialize Organizations client (for multi-account)
+	p.orgClient = organizations.NewFromConfig(p.awsConfig)
+
+	// Step 5: Discover accounts (if using Organizations)
+	if err := p.discoverAccounts(ctx); err != nil {
+		// Not fatal - might be a single account setup
+		logging.Debug("Could not discover organization accounts (might be single account)", zap.Error(err))
+	}
+
+	// Step 6: Get regions to scan
+	if err := p.setupRegions(ctx); err != nil {
+		return fmt.Errorf("failed to setup regions: %w", err)
+	}
+
+	logging.Info("✓ Connected to AWS successfully")
+	logging.Info("  Account ID", zap.String("account_id", p.currentAccount.AccountID))
+	logging.Info("  Regions to scan", zap.Strings("regions", p.regions))
+	if len(p.accounts) > 1 {
+		logging.Info("  Organization accounts found", zap.Int("count", len(p.accounts)))
+	}
+
 	return nil
 }
 
-// listAccounts lists AWS accounts in the organization
-func (p *AWSProvider) listAccounts(ctx context.Context) {
-	// Try to list organization accounts
-	result, err := p.orgClient.ListAccounts(ctx, &organizations.ListAccountsInput{})
-	if err != nil {
-		// Not an org master account or no org access, use current account only
-		logging.Debug("Could not list organization accounts, using current account only", zap.Error(err))
-		p.accounts = []models.AccountCount{
-			{
-				ID:   p.currentAccountID,
-				Name: p.currentAccountAlias,
-			},
-		}
-		return
+func (p *AWSProvider) loadAWSConfig(ctx context.Context) error {
+	logging.Debug("Loading AWS configuration...")
+
+	var opts []func(*awsConf.LoadOptions) error
+
+	// Set region
+	opts = append(opts, awsConf.WithRegion(p.config.Region))
+
+	// Use specific profile if provided
+	if p.config.Profile != "" {
+		logging.Debug("Using AWS profile", zap.String("profile", p.config.Profile))
+		opts = append(opts, awsConf.WithSharedConfigProfile(p.config.Profile))
 	}
 
-	// Store organization accounts
-	for _, account := range result.Accounts {
-		if account.Id != nil && account.Name != nil {
+	// Load the configuration
+	cfg, err := awsConf.LoadDefaultConfig(ctx, opts...)
+	if err != nil {
+		return fmt.Errorf("unable to load AWS SDK config: %w", err)
+	}
+
+	p.awsConfig = cfg
+	return nil
+}
+
+// verifyCredentials verifies AWS credentials are valid
+func (p *AWSProvider) verifyCredentials(ctx context.Context) error {
+	logging.Debug("Verifying AWS credentials...")
+
+	result, err := p.stsClient.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+	if err != nil {
+		return fmt.Errorf("failed to get caller identity: %w", err)
+	}
+
+	p.currentAccount = &CallerIdentity{
+		AccountID: *result.Account,
+		UserID:    *result.UserId,
+		Arn:       *result.Arn,
+	}
+
+	logging.Debug("Authenticated as", zap.String("arn", p.currentAccount.Arn))
+	return nil
+}
+
+func (p *AWSProvider) discoverAccounts(ctx context.Context) error {
+	logging.Debug("Discovering AWS accounts in the organization...")
+
+	// Check if we're in an organization
+	orgInfo, err := p.orgClient.DescribeOrganization(ctx, &organizations.DescribeOrganizationInput{})
+	if err != nil {
+		// Not in an organization, just use current account
+		p.accounts = append(p.accounts, models.AccountCount{
+			ID:   p.currentAccount.AccountID,
+			Name: "Current Account",
+		})
+		return err
+	}
+
+	logging.Debug("Organization ID", zap.String("organization_id", *orgInfo.Organization.Id))
+
+	// List all accounts in the organization
+	paginator := organizations.NewListAccountsPaginator(p.orgClient, &organizations.ListAccountsInput{})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to list organization accounts: %w", err)
+		}
+
+		for _, account := range page.Accounts {
 			p.accounts = append(p.accounts, models.AccountCount{
 				ID:   *account.Id,
 				Name: *account.Name,
@@ -81,114 +169,45 @@ func (p *AWSProvider) listAccounts(ctx context.Context) {
 		}
 	}
 
-	logging.Info("Found AWS accounts", zap.Int("count", len(p.accounts)))
+	logging.Debug("Found accounts in organization", zap.Int("count", len(p.accounts)))
+	return nil
 }
 
-func (p *AWSProvider) CountResources(ctx context.Context) (*models.ResourceCount, error) {
+func (p *AWSProvider) setupRegions(ctx context.Context) error {
+	if len(p.config.Regions) > 0 {
+		p.regions = p.config.Regions
+	}
+
+	// use EC2.DescribeRegions to get all regions
+	ec2Client := ec2.NewFromConfig(p.awsConfig)
+	output, err := ec2Client.DescribeRegions(ctx, &ec2.DescribeRegionsInput{
+		AllRegions: aws.Bool(true),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to describe regions: %w", err)
+	}
+
+	var availableRegions []string
+	for _, region := range output.Regions {
+		if region.RegionName != nil {
+			availableRegions = append(availableRegions, *region.RegionName)
+		}
+	}
+
+	logging.Debug("Available AWS regions", zap.Strings("regions", availableRegions))
+	if len(p.regions) == 0 {
+		p.regions = availableRegions
+	}
+
+	return nil
+}
+
+func (p *AWSProvider) CountResources(ctx context.Context) (*models.SizingResult, error) {
 	logging.Info("Counting AWS resources...")
 
 	// List all accounts
 
-	return &models.ResourceCount{}, nil
-}
-
-// ListResources lists all resources from AWS
-func (p *AWSProvider) ListResources(ctx context.Context) ([]models.Resource, error) {
-	logging.Info("Listing AWS resources...")
-
-	// Get regions to scan
-	regions := p.getRegionsToScan()
-	if len(regions) == 0 {
-		regions = []string{"us-east-1", "us-west-2", "eu-west-1"} // Default regions
-	}
-
-	logging.Info("Scanning regions", zap.Strings("regions", regions))
-
-	// Collect resources from all regions in parallel
-	var wg sync.WaitGroup
-	resourcesChan := make(chan []models.Resource, len(regions))
-	errorsChan := make(chan error, len(regions))
-
-	for _, region := range regions {
-		wg.Add(1)
-		go func(r string) {
-			defer wg.Done()
-
-			resources, err := p.listResourcesForRegion(ctx, r)
-			if err != nil {
-				errorsChan <- fmt.Errorf("failed to list resources for region %s: %w", r, err)
-				return
-			}
-
-			resourcesChan <- resources
-		}(region)
-	}
-
-	// Wait for all goroutines to complete
-	wg.Wait()
-	close(resourcesChan)
-	close(errorsChan)
-
-	// Check for errors
-	if len(errorsChan) > 0 {
-		return nil, <-errorsChan
-	}
-
-	// Aggregate all resources
-	var allResources []models.Resource
-	for resources := range resourcesChan {
-		allResources = append(allResources, resources...)
-	}
-
-	logging.Info("AWS resource listing complete", zap.Int("total_resources", len(allResources)))
-	return allResources, nil
-}
-
-// getRegionsToScan returns the list of regions to scan
-func (p *AWSProvider) getRegionsToScan() []string {
-
-	// Could dynamically fetch enabled regions using EC2 DescribeRegions
-	// For now, return default regions
-	return []string{
-		"us-east-1",
-		"us-west-2",
-		"eu-west-1",
-		"ap-southeast-1",
-	}
-}
-
-// listResourcesForRegion lists resources for a specific region
-func (p *AWSProvider) listResourcesForRegion(ctx context.Context, region string) ([]models.Resource, error) {
-	logging.Debug("Listing resources for region", zap.String("region", region))
-
-	// Initialize clients for this region
-	if err := p.initializeClientsForRegion(region); err != nil {
-		return nil, fmt.Errorf("failed to initialize clients: %w", err)
-	}
-
-	var resources []models.Resource
-	var wg sync.WaitGroup
-
-	wg.Wait()
-
-	return resources, nil
-}
-
-// initializeClientsForRegion initializes AWS clients for a specific region
-func (p *AWSProvider) initializeClientsForRegion(region string) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	// Create region-specific config
-	regionConfig := p.awsConfig.Copy()
-	regionConfig.Region = region
-
-	// Initialize tagging client
-	if _, exists := p.taggingClients[region]; !exists {
-		p.taggingClients[region] = resourcegroupstaggingapi.NewFromConfig(regionConfig)
-	}
-
-	return nil
+	return &models.SizingResult{}, nil
 }
 
 // Close closes any open connections

@@ -47,37 +47,37 @@ func (a *Agent) Run() error {
 	defer cloudProvider.Close()
 
 	// Count resources
-	results, err := cloudProvider.CountResources(ctx)
+	result, err := cloudProvider.CountResources(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to count resources: %w", err)
 	}
 
-	return a.outputResults(results)
+	return a.outputResults(result)
 }
 
 // outputResults formats and outputs the counting results
-func (a *Agent) outputResults(results *models.ResourceCount) error {
+func (a *Agent) outputResults(result *models.SizingResult) error {
 	switch a.config.OutputFormat {
 	case "json":
-		return a.outputJSON(results)
+		return a.outputJSON(result)
 	default: // table format
-		return a.outputTable(results)
+		return a.outputTable(result)
 	}
 }
 
 // outputTable prints results in a table format
-func (a *Agent) outputTable(results *models.ResourceCount) error {
+func (a *Agent) outputTable(result *models.SizingResult) error {
 	fmt.Println("\n=================================")
-	fmt.Printf("Provider: %s\n", results.Provider)
-	fmt.Printf("Accounts/Subscriptions: %d\n", len(results.Accounts))
-	fmt.Printf("Total Resources: %d\n", results.TotalResources)
+	fmt.Printf("Provider: %s\n", result.Provider)
+	fmt.Printf("Accounts/Subscriptions: %d\n", len(result.AccountCounts))
+	fmt.Printf("Total Resources: %d\n", result.TotalResources)
 	fmt.Println("---------------------------------")
 	fmt.Println("Resource Breakdown:")
-	for resourceType, count := range results.ResourcesByType {
-		fmt.Printf("  %-20s: %d\n", resourceType, count)
+	for _, resourceType := range result.ResourceCounts {
+		fmt.Printf("  %-20v: %d\n", resourceType.DisplayName, resourceType.TotalResources)
 	}
 	fmt.Println("=================================")
-	fmt.Printf("Timestamp: %s\n", results.Timestamp)
+	fmt.Printf("Timestamp: %s\n", result.Timestamp)
 
 	// TODO: If OutputFile is specified, write to file
 	if a.config.OutputFile != "" {
@@ -88,7 +88,7 @@ func (a *Agent) outputTable(results *models.ResourceCount) error {
 }
 
 // outputJSON outputs results in JSON format
-func (a *Agent) outputJSON(results *models.ResourceCount) error {
+func (a *Agent) outputJSON(results *models.SizingResult) error {
 	// TODO: Implement JSON output
 	fmt.Println("TODO: JSON output not yet implemented")
 	return nil

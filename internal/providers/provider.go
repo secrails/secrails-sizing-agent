@@ -14,10 +14,8 @@ type Provider interface {
 	// Connect establishes connection to the cloud provider
 	Connect(ctx context.Context) error
 
-	// ListResources lists all resources from the provider
-	ListResources(ctx context.Context) ([]models.Resource, error)
-
-	CountResources(ctx context.Context) (*models.ResourceCount, error)
+	// CountResources counts all resources and returns complete results
+	CountResources(ctx context.Context) (*models.SizingResult, error)
 
 	// Close closes any open connections
 	Close() error

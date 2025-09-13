@@ -26,10 +26,9 @@ func (m *ProviderManager) GetProvider(providerName string) (Provider, error) {
 	providerName = strings.ToLower(strings.TrimSpace(providerName))
 
 	config := config.ProviderConfig{
-		Provider:    providerName,
-		Credentials: make(map[string]interface{}),
-		Regions:     []string{},
-		Resources:   []string{},
+		Provider:  providerName,
+		Regions:   []string{},
+		Resources: []string{},
 	}
 	switch providerName {
 	case "aws":
