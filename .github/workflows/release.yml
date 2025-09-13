@@ -6,7 +6,7 @@ on:
       - 'v*'
 
 env:
-  GO_VERSION: '1.21'  # Update to your Go version
+  GO_VERSION: '1.24'  # Update to your Go version
 
 permissions:
   contents: write
