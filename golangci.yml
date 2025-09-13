@@ -1,0 +1,42 @@
+run:
+  timeout: 5m
+  modules-download-mode: readonly
+
+linters:
+  enable:
+    - gofmt
+    - goimports
+    - govet
+    - errcheck
+    - staticcheck
+    - gosimple
+    - ineffassign
+    - unused
+    - gosec
+    - revive
+    - misspell
+    - unconvert
+    - gocyclo
+    - gocognit
+    - godox
+    - prealloc
+    - bodyclose
+    - stylecheck
+
+linters-settings:
+  gocyclo:
+    min-complexity: 15
+  gocognit:
+    min-complexity: 20
+  revive:
+    rules:
+      - name: var-naming
+      - name: package-comments
+      - name: range
+      - name: indent-error-flow
+      - name: errorf
+
+issues:
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0

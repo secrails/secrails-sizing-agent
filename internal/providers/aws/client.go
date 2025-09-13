@@ -3,10 +3,13 @@ package aws
 import (
 	"context"
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsConf "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/organizations"
 	"github.com/aws/aws-sdk-go-v2/service/resourcegroupstaggingapi"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
@@ -32,6 +35,9 @@ type AWSProvider struct {
 	currentAccount *CallerIdentity
 	accounts       []models.AccountCount
 	regions        []string
+
+	// Resource collector
+	collector *ResourceCollector
 }
 
 // NewAWSProvider creates a new AWS provider
@@ -40,6 +46,7 @@ func NewAWSProvider(cfg config.ProviderConfig) (*AWSProvider, error) {
 		config:         cfg,
 		taggingClients: make(map[string]*resourcegroupstaggingapi.Client),
 		accounts:       []models.AccountCount{},
+		collector:      &ResourceCollector{},
 	}
 
 	return provider, nil
@@ -77,6 +84,11 @@ func (p *AWSProvider) Connect(ctx context.Context) error {
 	// Step 6: Get regions to scan
 	if err := p.setupRegions(ctx); err != nil {
 		return fmt.Errorf("failed to setup regions: %w", err)
+	}
+
+	// Step 7: Initialize tagging clients for each region
+	if err := p.initializeClients(); err != nil {
+		return fmt.Errorf("failed to initialize tagging clients: %w", err)
 	}
 
 	logging.Info("✓ Connected to AWS successfully")
@@ -132,8 +144,25 @@ func (p *AWSProvider) verifyCredentials(ctx context.Context) error {
 	return nil
 }
 
+func (p *AWSProvider) initializeClients() error {
+	logging.Debug("Initializing tagging clients for each region...")
+
+	for _, region := range p.regions {
+		// Create a new config for this region
+		regionalConfig := p.awsConfig.Copy()
+		regionalConfig.Region = region
+
+		// Create tagging client for this region
+		p.taggingClients[region] = resourcegroupstaggingapi.NewFromConfig(regionalConfig)
+
+		logging.Debug("Initialized tagging client", zap.String("region", region))
+	}
+
+	return nil
+}
+
 func (p *AWSProvider) discoverAccounts(ctx context.Context) error {
-	logging.Debug("Discovering AWS accounts in the organization...")
+	logging.Info("Discovering AWS accounts in the organization...")
 
 	// Check if we're in an organization
 	orgInfo, err := p.orgClient.DescribeOrganization(ctx, &organizations.DescribeOrganizationInput{})
@@ -143,18 +172,23 @@ func (p *AWSProvider) discoverAccounts(ctx context.Context) error {
 			ID:   p.currentAccount.AccountID,
 			Name: "Current Account",
 		})
-		return err
+		logging.Debug("Not in an organization, using single account")
+		return nil
 	}
 
-	logging.Debug("Organization ID", zap.String("organization_id", *orgInfo.Organization.Id))
+	logging.Info("Organization ID", zap.String("organization_id", *orgInfo.Organization.Id))
 
-	// List all accounts in the organization
+	// Try to list all accounts in the organization (only works for management account)
 	paginator := organizations.NewListAccountsPaginator(p.orgClient, &organizations.ListAccountsInput{})
 
+	accountsFound := false
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return fmt.Errorf("failed to list organization accounts: %w", err)
+			// If we can't list accounts (likely a member account, not management account)
+			logging.Warn("Cannot list organization accounts (requires management account permissions)",
+				zap.Error(err))
+			break // Don't return error, just break the loop
 		}
 
 		for _, account := range page.Accounts {
@@ -162,22 +196,34 @@ func (p *AWSProvider) discoverAccounts(ctx context.Context) error {
 				ID:   *account.Id,
 				Name: *account.Name,
 			})
+			logging.Debug("Added account", zap.String("id", *account.Id), zap.String("name", *account.Name))
+			accountsFound = true
 		}
 	}
 
-	logging.Debug("Found accounts in organization", zap.Int("count", len(p.accounts)))
+	// If no accounts were found (member account scenario), just use current account
+	if !accountsFound {
+		p.accounts = append(p.accounts, models.AccountCount{
+			ID:   p.currentAccount.AccountID,
+			Name: "Current Account (Organization Member)",
+		})
+		logging.Info("Using current account only (member account in organization)")
+	}
+
+	logging.Info("Found accounts", zap.Int("count", len(p.accounts)))
 	return nil
 }
 
 func (p *AWSProvider) setupRegions(ctx context.Context) error {
-	if len(p.config.Regions) > 0 {
-		p.regions = p.config.Regions
-	}
-
-	// use EC2.DescribeRegions to get all regions
 	ec2Client := ec2.NewFromConfig(p.awsConfig)
 	output, err := ec2Client.DescribeRegions(ctx, &ec2.DescribeRegionsInput{
-		AllRegions: aws.Bool(true),
+		AllRegions: aws.Bool(false), // Changed to false - only opted-in regions
+		Filters: []types.Filter{
+			{
+				Name:   aws.String("opt-in-status"),
+				Values: []string{"opt-in-not-required", "opted-in"},
+			},
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("failed to describe regions: %w", err)
@@ -201,9 +247,73 @@ func (p *AWSProvider) setupRegions(ctx context.Context) error {
 func (p *AWSProvider) CountResources(ctx context.Context) (*models.SizingResult, error) {
 	logging.Info("Counting AWS resources...")
 
-	// List all accounts
+	if len(p.accounts) == 0 {
+		return nil, fmt.Errorf("no accounts available to scan")
+	}
 
-	return &models.SizingResult{}, nil
+	// Initialize result
+	result := &models.SizingResult{
+		Provider:  "AWS",
+		Timestamp: time.Now(),
+	}
+
+	// Create semaphore for concurrent operations
+	maxConcurrency := 5
+	semaphore := make(chan struct{}, maxConcurrency)
+
+	// Get resource types to count
+	resourceTypes := p.collector.GetResourceTypesToCount()
+	logging.Debug("Resource types to count", zap.Int("count", len(resourceTypes)))
+
+	var wg sync.WaitGroup
+	resourceCounts := make([]*models.ResourceCount, 0)
+	resultsMu := sync.Mutex{}
+
+	// Count each resource type
+	for _, rt := range resourceTypes {
+		wg.Add(1)
+		go func(resourceDef models.ResourceDefinition) {
+			defer wg.Done()
+
+			// Acquire semaphore
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			// Count this resource type
+			count, err := p.collector.CountResourceType(ctx, resourceDef, p.regions, p.taggingClients)
+			if err != nil {
+				logging.Error("Failed to count resource type",
+					zap.String("type", resourceDef.Type),
+					zap.Error(err))
+				return
+			}
+
+			// Store result
+			resultsMu.Lock()
+			resourceCounts = append(resourceCounts, count)
+			resultsMu.Unlock()
+		}(rt)
+	}
+
+	// Wait for all goroutines to complete
+	wg.Wait()
+
+	// Populate SizingResult
+	result.ResourceCounts = resourceCounts
+	result.AccountCounts = p.accounts
+
+	// Calculate totals
+	for _, rc := range resourceCounts {
+		result.TotalResources += rc.TotalResources
+	}
+	result.TotalAccounts = len(p.accounts)
+
+	logging.Info("Resource counting completed",
+		zap.Int("total_resources", result.TotalResources),
+		zap.Int("resource_types_counted", len(resourceCounts)),
+		zap.Int("accounts", result.TotalAccounts))
+
+	return result, nil
 }
 
 // Close closes any open connections
