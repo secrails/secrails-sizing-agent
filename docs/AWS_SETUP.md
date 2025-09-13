@@ -79,7 +79,9 @@ AWS_PROFILE=default  # Optional
 If running on AWS infrastructure, the agent will automatically use the instance's IAM role.
 
 ## Required IAM Permissions
+
 The sizing agent needs at least the following permissions:
+
 ```json
 {
   "Version": "2012-10-17",
@@ -101,10 +103,10 @@ The sizing agent needs at least the following permissions:
   ]
 }
 ```
+
 ## For Organization-wide Scanning
+
 If you want to scan all accounts in an AWS Organization, you'll need:
 
 Run from the Organization's management account, OR
 Set up cross-account roles with AssumeRole permissions
-
-
