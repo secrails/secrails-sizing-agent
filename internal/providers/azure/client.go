@@ -38,8 +38,6 @@ type AzureProvider struct {
 
 	// Resource collector
 	collector *ResourceCollector
-
-	mu sync.RWMutex
 }
 
 // NewAzureProvider creates a new Azure provider

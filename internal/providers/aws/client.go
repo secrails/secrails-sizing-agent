@@ -3,7 +3,6 @@ package aws
 import (
 	"context"
 	"fmt"
-	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsConf "github.com/aws/aws-sdk-go-v2/config"
@@ -30,12 +29,9 @@ type AWSProvider struct {
 	taggingClients map[string]*resourcegroupstaggingapi.Client
 
 	// Account information
-	currentAccount      *CallerIdentity
-	currentAccountAlias string
-	accounts            []models.AccountCount
-	regions             []string
-
-	mu sync.RWMutex
+	currentAccount *CallerIdentity
+	accounts       []models.AccountCount
+	regions        []string
 }
 
 // NewAWSProvider creates a new AWS provider

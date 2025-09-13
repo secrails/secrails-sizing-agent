@@ -44,7 +44,11 @@ func (a *Agent) Run() error {
 		return fmt.Errorf("failed to connect to %s: %w", cloudProvider.Name(), err)
 	}
 
-	defer cloudProvider.Close()
+	defer func() {
+		if err := cloudProvider.Close(); err != nil {
+			fmt.Printf("⚠️  Warning: failed to close provider connection: %v\n", err)
+		}
+	}()
 
 	// Count resources
 	result, err := cloudProvider.CountResources(ctx)
